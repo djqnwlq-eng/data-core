@@ -10,9 +10,10 @@ import {
   Loader2,
   CheckCircle,
   X,
+  HelpCircle,
 } from 'lucide-react';
 
-type Tab = 'chat' | 'knowledge';
+type Tab = 'chat' | 'knowledge' | 'qa';
 
 interface UploadResult {
   fileName: string;
@@ -173,11 +174,40 @@ export default function RegisterPage() {
     }
   }
 
+  // Q&A 직접 등록
+  const [qaQuestion, setQaQuestion] = useState('');
+  const [qaAnswer, setQaAnswer] = useState('');
+  const [qaLoading, setQaLoading] = useState(false);
+  const [qaSuccess, setQaSuccess] = useState(false);
+
+  async function handleQaSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!qaQuestion.trim() || !qaAnswer.trim()) return;
+    setQaLoading(true);
+    setQaSuccess(false);
+    try {
+      const res = await fetch('/api/custom-answers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: qaQuestion, answer: qaAnswer, source: 'direct' }),
+      });
+      if (res.ok) {
+        setQaSuccess(true);
+        setQaQuestion('');
+        setQaAnswer('');
+      } else {
+        const data = await res.json();
+        alert(data.error || '등록에 실패했습니다.');
+      }
+    } catch { alert('네트워크 오류가 발생했습니다.'); }
+    finally { setQaLoading(false); }
+  }
+
   const totalFilesSize = chatFiles.reduce((sum, f) => sum + f.size, 0);
 
   return (
     <div className="max-w-3xl mx-auto">
-      <PageHeader title="데이터 등록" description="채팅 기록과 강의 대본을 등록합니다." />
+      <PageHeader title="데이터 등록" description="채팅 기록, 강의 대본, Q&A를 등록합니다." />
 
       {/* 탭 */}
       <div className="flex gap-2 mb-6">
@@ -202,6 +232,17 @@ export default function RegisterPage() {
         >
           <PenLine className="w-4 h-4" />
           강의 대본 / 지식
+        </button>
+        <button
+          onClick={() => setTab('qa')}
+          className={`flex items-center gap-2 px-5 py-3 rounded-xl font-medium transition-colors ${
+            tab === 'qa'
+              ? 'bg-primary text-white'
+              : 'bg-card border border-border text-muted hover:bg-slate-50'
+          }`}
+        >
+          <HelpCircle className="w-4 h-4" />
+          Q&A 등록
         </button>
       </div>
 
@@ -415,6 +456,60 @@ export default function RegisterPage() {
             <div className="bg-green-50 border border-green-200 rounded-xl p-4 flex items-center gap-2">
               <CheckCircle className="w-4 h-4 text-green-600" />
               <span className="text-sm text-green-800 font-medium">등록 완료!</span>
+            </div>
+          )}
+        </form>
+      )}
+
+      {/* Q&A 직접 등록 */}
+      {tab === 'qa' && (
+        <form onSubmit={handleQaSubmit} className="bg-card rounded-2xl border border-border p-6 space-y-5">
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+            <p className="text-sm text-amber-700">
+              자주 받는 질문과 정확한 답변을 등록하면, 검색 시 AI 답변보다 우선적으로 표시됩니다.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-1.5">질문</label>
+            <input
+              type="text"
+              value={qaQuestion}
+              onChange={(e) => setQaQuestion(e.target.value)}
+              placeholder="예: 상표권은 몇 류로 등록해야 하나요?"
+              className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+              required
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-1.5">답변</label>
+            <textarea
+              value={qaAnswer}
+              onChange={(e) => setQaAnswer(e.target.value)}
+              placeholder="예: 화장품은 03류로 등록하시면 됩니다. 비용은 약 20~30만원이며..."
+              rows={6}
+              className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary resize-y"
+              required
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={qaLoading}
+            className="w-full py-3 bg-primary text-white rounded-xl hover:bg-primary-hover transition-colors font-medium disabled:opacity-50 flex items-center justify-center gap-2"
+          >
+            {qaLoading ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> 등록 중...</>
+            ) : (
+              'Q&A 등록'
+            )}
+          </button>
+
+          {qaSuccess && (
+            <div className="bg-green-50 border border-green-200 rounded-xl p-4 flex items-center gap-2">
+              <CheckCircle className="w-4 h-4 text-green-600" />
+              <span className="text-sm text-green-800 font-medium">Q&A 등록 완료! 검색 시 우선 표시됩니다.</span>
             </div>
           )}
         </form>

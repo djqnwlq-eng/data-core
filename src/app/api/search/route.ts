@@ -4,7 +4,6 @@ import { generateEmbedding, generateAnswer } from '@/lib/gemini';
 
 // 검색어를 핵심 키워드로 분리
 function extractKeywords(query: string): string[] {
-  // 조사, 어미 등 불용어 제거
   const stopWords = ['은', '는', '이', '가', '을', '를', '의', '에', '에서', '으로', '로', '와', '과', '도', '만', '까지', '부터', '하나요', '할까요', '될까요', '인가요', '해야', '하면', '해서', '하고', '있나요', '없나요', '어떻게', '무엇', '어디', '언제'];
 
   const words = query
@@ -13,8 +12,84 @@ function extractKeywords(query: string): string[] {
     .filter(w => w.length >= 2)
     .filter(w => !stopWords.includes(w));
 
-  // 원본 쿼리도 포함 (완전 일치용)
   return [...new Set([query, ...words])];
+}
+
+interface QAPair {
+  id: string;
+  question: { sender: string; message: string; date: string };
+  answers: { sender: string; message: string; date: string }[];
+  room_name: string;
+}
+
+// 매칭된 메시지의 앞뒤 대화를 가져와서 Q&A 쌍으로 만듦
+async function getConversationContext(matchedMsg: {
+  id: string; sender: string; message: string; room_name: string; chat_date: string | null; created_at: string;
+}): Promise<QAPair | null> {
+  const msgDate = matchedMsg.chat_date || matchedMsg.created_at;
+  if (!msgDate) return null;
+
+  // 해당 메시지 전후 5분 이내 같은 채팅방 메시지 가져오기
+  const date = new Date(msgDate);
+  const before = new Date(date.getTime() - 5 * 60 * 1000).toISOString();
+  const after = new Date(date.getTime() + 30 * 60 * 1000).toISOString();
+
+  const { data: nearby } = await supabase
+    .from('chat_messages')
+    .select('*')
+    .eq('room_name', matchedMsg.room_name)
+    .gte('chat_date', before)
+    .lte('chat_date', after)
+    .order('chat_date', { ascending: true })
+    .limit(10);
+
+  if (!nearby || nearby.length === 0) return null;
+
+  // 매칭된 메시지를 질문으로, 다른 사람의 답변을 찾기
+  const questionSender = matchedMsg.sender;
+  const answers = nearby
+    .filter(m => m.sender !== questionSender && m.message.length > 5)
+    .slice(0, 3)
+    .map(m => ({
+      sender: m.sender,
+      message: m.message,
+      date: m.chat_date || m.created_at,
+    }));
+
+  // 답변이 없으면 매칭된 메시지가 답변일 수도 있음 - 앞의 질문을 찾기
+  if (answers.length === 0) {
+    const questionMsgs = nearby
+      .filter(m => m.sender !== questionSender && m.message.includes('?'))
+      .slice(0, 1);
+
+    if (questionMsgs.length > 0) {
+      return {
+        id: matchedMsg.id,
+        question: {
+          sender: questionMsgs[0].sender,
+          message: questionMsgs[0].message,
+          date: questionMsgs[0].chat_date || questionMsgs[0].created_at,
+        },
+        answers: [{
+          sender: matchedMsg.sender,
+          message: matchedMsg.message,
+          date: msgDate,
+        }],
+        room_name: matchedMsg.room_name,
+      };
+    }
+  }
+
+  return {
+    id: matchedMsg.id,
+    question: {
+      sender: matchedMsg.sender,
+      message: matchedMsg.message,
+      date: msgDate,
+    },
+    answers,
+    room_name: matchedMsg.room_name,
+  };
 }
 
 export async function GET(request: NextRequest) {
@@ -25,55 +100,38 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: '검색어가 필요합니다.' }, { status: 400 });
   }
 
-  // 검색 기록 저장 (비동기)
+  // 검색 기록 저장
   supabase.from('search_logs').insert({ query }).then(() => {});
 
   const keywords = extractKeywords(query);
-
-  const chatResults: {
-    id: string;
-    title: string;
-    content: string;
-    sender: string;
-    room_name: string;
-    similarity?: number;
-    created_at?: string;
-  }[] = [];
+  const qaPairs: QAPair[] = [];
+  const addedChatIds = new Set<string>();
 
   const knowledgeResults: {
-    id: string;
-    title: string;
-    content: string;
-    category: string;
-    source_type: string;
-    similarity?: number;
-    created_at?: string;
+    id: string; title: string; content: string;
+    category: string; source_type: string; similarity?: number; created_at?: string;
   }[] = [];
-
-  const addedChatIds = new Set<string>();
   const addedKnowledgeIds = new Set<string>();
 
-  // 1. 키워드별 검색 - 채팅
+  // 1. 키워드별 검색 - 채팅 → Q&A 쌍으로 변환
   for (const keyword of keywords) {
+    if (qaPairs.length >= 5) break;
+
     const { data: chatKeyword } = await supabase
       .from('chat_messages')
       .select('*')
       .ilike('message', `%${keyword}%`)
       .order('chat_date', { ascending: false })
-      .limit(10);
+      .limit(5);
 
     if (chatKeyword) {
       for (const item of chatKeyword) {
-        if (!addedChatIds.has(item.id)) {
-          addedChatIds.add(item.id);
-          chatResults.push({
-            id: item.id,
-            title: `${item.sender}`,
-            content: item.message,
-            sender: item.sender,
-            room_name: item.room_name,
-            created_at: item.chat_date || item.created_at,
-          });
+        if (addedChatIds.has(item.id) || qaPairs.length >= 5) continue;
+        addedChatIds.add(item.id);
+
+        const qa = await getConversationContext(item);
+        if (qa) {
+          qaPairs.push(qa);
         }
       }
     }
@@ -111,50 +169,20 @@ export async function GET(request: NextRequest) {
     const { data: semanticResults } = await supabase.rpc('match_embeddings', {
       query_embedding: JSON.stringify(queryEmbedding),
       match_threshold: 0.4,
-      match_count: 15,
+      match_count: 10,
     });
 
     if (semanticResults) {
       for (const item of semanticResults) {
-        if (item.source_table === 'knowledge') {
-          if (!addedKnowledgeIds.has(item.source_id)) {
-            const { data: original } = await supabase
-              .from('knowledge')
-              .select('*')
-              .eq('id', item.source_id)
-              .single();
-            if (original) {
-              addedKnowledgeIds.add(original.id);
-              knowledgeResults.push({
-                id: original.id,
-                title: original.title,
-                content: original.content,
-                category: original.category,
-                source_type: original.source_type,
-                similarity: item.similarity,
-                created_at: original.created_at,
-              });
-            }
-          }
-        } else if (item.source_table === 'chat_messages') {
-          if (!addedChatIds.has(item.source_id)) {
-            const { data: original } = await supabase
-              .from('chat_messages')
-              .select('*')
-              .eq('id', item.source_id)
-              .single();
-            if (original) {
-              addedChatIds.add(original.id);
-              chatResults.push({
-                id: original.id,
-                title: `${original.sender}`,
-                content: original.message,
-                sender: original.sender,
-                room_name: original.room_name,
-                similarity: item.similarity,
-                created_at: original.chat_date || original.created_at,
-              });
-            }
+        if (item.source_table === 'knowledge' && !addedKnowledgeIds.has(item.source_id)) {
+          const { data: original } = await supabase.from('knowledge').select('*').eq('id', item.source_id).single();
+          if (original) {
+            addedKnowledgeIds.add(original.id);
+            knowledgeResults.push({
+              id: original.id, title: original.title, content: original.content,
+              category: original.category, source_type: original.source_type,
+              similarity: item.similarity, created_at: original.created_at,
+            });
           }
         }
       }
@@ -163,24 +191,47 @@ export async function GET(request: NextRequest) {
     console.error('의미 검색 실패:', error);
   }
 
-  // 4. AI 추천 답변 생성
-  let aiAnswer: string | null = null;
-  const allContent = [
-    ...knowledgeResults.slice(0, 2).map(r => r.content.slice(0, 500)),
-    ...chatResults.slice(0, 3).map(r => `${r.sender}: ${r.content.slice(0, 300)}`),
-  ];
+  // 4. 커스텀 답변 검색
+  let customAnswer: { id: string; question: string; answer: string; source: string } | null = null;
+  for (const keyword of keywords.slice(0, 3)) {
+    if (customAnswer) break;
+    const { data: customs } = await supabase
+      .from('custom_answers')
+      .select('*')
+      .or(`question.ilike.%${keyword}%,keywords.cs.{${keyword}}`)
+      .limit(1);
 
-  if (allContent.length > 0) {
-    try {
-      aiAnswer = await generateAnswer(query, allContent);
-    } catch (error) {
-      console.error('AI 답변 생성 실패:', error);
+    if (customs && customs.length > 0) {
+      customAnswer = {
+        id: customs[0].id, question: customs[0].question,
+        answer: customs[0].answer, source: customs[0].source,
+      };
+    }
+  }
+
+  // 5. AI 추천 답변 생성 (커스텀 답변이 없을 때만)
+  let aiAnswer: string | null = null;
+  if (!customAnswer) {
+    const allContent = [
+      ...knowledgeResults.slice(0, 2).map(r => r.content.slice(0, 500)),
+      ...qaPairs.slice(0, 2).map(qa =>
+        `질문(${qa.question.sender}): ${qa.question.message}\n답변: ${qa.answers.map(a => `${a.sender}: ${a.message}`).join('\n')}`
+      ),
+    ];
+
+    if (allContent.length > 0) {
+      try {
+        aiAnswer = await generateAnswer(query, allContent);
+      } catch (error) {
+        console.error('AI 답변 생성 실패:', error);
+      }
     }
   }
 
   return NextResponse.json({
-    chatResults: chatResults.slice(0, 15),
+    qaPairs: qaPairs.slice(0, 3),
     knowledgeResults: knowledgeResults.slice(0, 10),
+    customAnswer,
     aiAnswer,
   });
 }
