@@ -2,6 +2,21 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase-server';
 import { generateEmbedding, generateAnswer } from '@/lib/gemini';
 
+// 검색어를 핵심 키워드로 분리
+function extractKeywords(query: string): string[] {
+  // 조사, 어미 등 불용어 제거
+  const stopWords = ['은', '는', '이', '가', '을', '를', '의', '에', '에서', '으로', '로', '와', '과', '도', '만', '까지', '부터', '하나요', '할까요', '될까요', '인가요', '해야', '하면', '해서', '하고', '있나요', '없나요', '어떻게', '무엇', '어디', '언제'];
+
+  const words = query
+    .replace(/[?!.,~]/g, '')
+    .split(/\s+/)
+    .filter(w => w.length >= 2)
+    .filter(w => !stopWords.includes(w));
+
+  // 원본 쿼리도 포함 (완전 일치용)
+  return [...new Set([query, ...words])];
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
@@ -12,6 +27,8 @@ export async function GET(request: NextRequest) {
 
   // 검색 기록 저장 (비동기)
   supabase.from('search_logs').insert({ query }).then(() => {});
+
+  const keywords = extractKeywords(query);
 
   const chatResults: {
     id: string;
@@ -33,45 +50,58 @@ export async function GET(request: NextRequest) {
     created_at?: string;
   }[] = [];
 
-  // 1. 키워드 검색 - 채팅
-  const { data: chatKeyword } = await supabase
-    .from('chat_messages')
-    .select('*')
-    .ilike('message', `%${query}%`)
-    .order('chat_date', { ascending: false })
-    .limit(15);
+  const addedChatIds = new Set<string>();
+  const addedKnowledgeIds = new Set<string>();
 
-  if (chatKeyword) {
-    for (const item of chatKeyword) {
-      chatResults.push({
-        id: item.id,
-        title: `${item.sender}`,
-        content: item.message,
-        sender: item.sender,
-        room_name: item.room_name,
-        created_at: item.chat_date || item.created_at,
-      });
+  // 1. 키워드별 검색 - 채팅
+  for (const keyword of keywords) {
+    const { data: chatKeyword } = await supabase
+      .from('chat_messages')
+      .select('*')
+      .ilike('message', `%${keyword}%`)
+      .order('chat_date', { ascending: false })
+      .limit(10);
+
+    if (chatKeyword) {
+      for (const item of chatKeyword) {
+        if (!addedChatIds.has(item.id)) {
+          addedChatIds.add(item.id);
+          chatResults.push({
+            id: item.id,
+            title: `${item.sender}`,
+            content: item.message,
+            sender: item.sender,
+            room_name: item.room_name,
+            created_at: item.chat_date || item.created_at,
+          });
+        }
+      }
     }
   }
 
-  // 2. 키워드 검색 - 지식(대본)
-  const { data: knowledgeKeyword } = await supabase
-    .from('knowledge')
-    .select('*')
-    .or(`title.ilike.%${query}%,content.ilike.%${query}%`)
-    .order('created_at', { ascending: false })
-    .limit(10);
+  // 2. 키워드별 검색 - 지식(대본)
+  for (const keyword of keywords) {
+    const { data: knowledgeKeyword } = await supabase
+      .from('knowledge')
+      .select('*')
+      .or(`title.ilike.%${keyword}%,content.ilike.%${keyword}%`)
+      .order('created_at', { ascending: false })
+      .limit(5);
 
-  if (knowledgeKeyword) {
-    for (const item of knowledgeKeyword) {
-      knowledgeResults.push({
-        id: item.id,
-        title: item.title,
-        content: item.content,
-        category: item.category,
-        source_type: item.source_type,
-        created_at: item.created_at,
-      });
+    if (knowledgeKeyword) {
+      for (const item of knowledgeKeyword) {
+        if (!addedKnowledgeIds.has(item.id)) {
+          addedKnowledgeIds.add(item.id);
+          knowledgeResults.push({
+            id: item.id,
+            title: item.title,
+            content: item.content,
+            category: item.category,
+            source_type: item.source_type,
+            created_at: item.created_at,
+          });
+        }
+      }
     }
   }
 
@@ -87,13 +117,14 @@ export async function GET(request: NextRequest) {
     if (semanticResults) {
       for (const item of semanticResults) {
         if (item.source_table === 'knowledge') {
-          if (!knowledgeResults.some(r => r.id === item.source_id)) {
+          if (!addedKnowledgeIds.has(item.source_id)) {
             const { data: original } = await supabase
               .from('knowledge')
               .select('*')
               .eq('id', item.source_id)
               .single();
             if (original) {
+              addedKnowledgeIds.add(original.id);
               knowledgeResults.push({
                 id: original.id,
                 title: original.title,
@@ -106,13 +137,14 @@ export async function GET(request: NextRequest) {
             }
           }
         } else if (item.source_table === 'chat_messages') {
-          if (!chatResults.some(r => r.id === item.source_id)) {
+          if (!addedChatIds.has(item.source_id)) {
             const { data: original } = await supabase
               .from('chat_messages')
               .select('*')
               .eq('id', item.source_id)
               .single();
             if (original) {
+              addedChatIds.add(original.id);
               chatResults.push({
                 id: original.id,
                 title: `${original.sender}`,
@@ -147,7 +179,7 @@ export async function GET(request: NextRequest) {
   }
 
   return NextResponse.json({
-    chatResults: chatResults.slice(0, 10),
+    chatResults: chatResults.slice(0, 15),
     knowledgeResults: knowledgeResults.slice(0, 10),
     aiAnswer,
   });
