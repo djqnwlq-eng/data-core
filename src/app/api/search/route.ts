@@ -6,13 +6,24 @@ import { generateEmbedding, generateAnswer } from '@/lib/gemini';
 function extractKeywords(query: string): string[] {
   const stopWords = ['은', '는', '이', '가', '을', '를', '의', '에', '에서', '으로', '로', '와', '과', '도', '만', '까지', '부터', '하나요', '할까요', '될까요', '인가요', '해야', '하면', '해서', '하고', '있나요', '없나요', '어떻게', '무엇', '어디', '언제'];
 
+  // 숫자+문자 조합(03류, 35류 등)은 보존
   const words = query
     .replace(/[?!.,~]/g, '')
     .split(/\s+/)
-    .filter(w => w.length >= 2)
+    .filter(w => w.length >= 2 || /\d/.test(w))
     .filter(w => !stopWords.includes(w));
 
-  return [...new Set([query, ...words])];
+  // 붙어있는 키워드도 분리 (예: "상표권은" → "상표권")
+  const extraWords: string[] = [];
+  for (const w of words) {
+    // 조사 제거 (2글자 이상 단어에서)
+    const stripped = w.replace(/(은|는|이|가|을|를|의|에|도|으로|로)$/, '');
+    if (stripped.length >= 2 && stripped !== w) {
+      extraWords.push(stripped);
+    }
+  }
+
+  return [...new Set([...words, ...extraWords])];
 }
 
 interface QAPair {
@@ -22,74 +33,73 @@ interface QAPair {
   room_name: string;
 }
 
-// 매칭된 메시지의 앞뒤 대화를 가져와서 Q&A 쌍으로 만듦
+// 매칭된 메시지의 직후 답변만 가져와서 Q&A 쌍으로 만듦
 async function getConversationContext(matchedMsg: {
   id: string; sender: string; message: string; room_name: string; chat_date: string | null; created_at: string;
 }): Promise<QAPair | null> {
   const msgDate = matchedMsg.chat_date || matchedMsg.created_at;
   if (!msgDate) return null;
 
-  // 해당 메시지 전후 5분 이내 같은 채팅방 메시지 가져오기
   const date = new Date(msgDate);
-  const before = new Date(date.getTime() - 5 * 60 * 1000).toISOString();
-  const after = new Date(date.getTime() + 30 * 60 * 1000).toISOString();
 
-  const { data: nearby } = await supabase
-    .from('chat_messages')
-    .select('*')
-    .eq('room_name', matchedMsg.room_name)
-    .gte('chat_date', before)
-    .lte('chat_date', after)
-    .order('chat_date', { ascending: true })
-    .limit(10);
+  // 질문인지 답변인지 판단 (물음표가 있거나 교육생이면 질문)
+  const isQuestion = matchedMsg.message.includes('?') || matchedMsg.message.includes('될까요') || matchedMsg.message.includes('하나요');
 
-  if (!nearby || nearby.length === 0) return null;
+  if (isQuestion) {
+    // 질문 직후 3분 이내 다른 사람의 답변 가져오기
+    const after = new Date(date.getTime() + 3 * 60 * 1000).toISOString();
 
-  // 매칭된 메시지를 질문으로, 다른 사람의 답변을 찾기
-  const questionSender = matchedMsg.sender;
-  const answers = nearby
-    .filter(m => m.sender !== questionSender && m.message.length > 5)
-    .slice(0, 3)
-    .map(m => ({
-      sender: m.sender,
-      message: m.message,
-      date: m.chat_date || m.created_at,
-    }));
+    const { data: replies } = await supabase
+      .from('chat_messages')
+      .select('*')
+      .eq('room_name', matchedMsg.room_name)
+      .gt('chat_date', msgDate)
+      .lte('chat_date', after)
+      .neq('sender', matchedMsg.sender)
+      .order('chat_date', { ascending: true })
+      .limit(3);
 
-  // 답변이 없으면 매칭된 메시지가 답변일 수도 있음 - 앞의 질문을 찾기
-  if (answers.length === 0) {
-    const questionMsgs = nearby
-      .filter(m => m.sender !== questionSender && m.message.includes('?'))
-      .slice(0, 1);
+    const answers = (replies || [])
+      .filter(m => m.message.length > 3)
+      .map(m => ({ sender: m.sender, message: m.message, date: m.chat_date || m.created_at }));
 
-    if (questionMsgs.length > 0) {
+    return {
+      id: matchedMsg.id,
+      question: { sender: matchedMsg.sender, message: matchedMsg.message, date: msgDate },
+      answers,
+      room_name: matchedMsg.room_name,
+    };
+  } else {
+    // 답변이 매칭된 경우 → 직전 3분 이내 질문 찾기
+    const before = new Date(date.getTime() - 3 * 60 * 1000).toISOString();
+
+    const { data: questions } = await supabase
+      .from('chat_messages')
+      .select('*')
+      .eq('room_name', matchedMsg.room_name)
+      .gte('chat_date', before)
+      .lt('chat_date', msgDate)
+      .neq('sender', matchedMsg.sender)
+      .order('chat_date', { ascending: false })
+      .limit(1);
+
+    if (questions && questions.length > 0) {
       return {
         id: matchedMsg.id,
-        question: {
-          sender: questionMsgs[0].sender,
-          message: questionMsgs[0].message,
-          date: questionMsgs[0].chat_date || questionMsgs[0].created_at,
-        },
-        answers: [{
-          sender: matchedMsg.sender,
-          message: matchedMsg.message,
-          date: msgDate,
-        }],
+        question: { sender: questions[0].sender, message: questions[0].message, date: questions[0].chat_date || questions[0].created_at },
+        answers: [{ sender: matchedMsg.sender, message: matchedMsg.message, date: msgDate }],
         room_name: matchedMsg.room_name,
       };
     }
-  }
 
-  return {
-    id: matchedMsg.id,
-    question: {
-      sender: matchedMsg.sender,
-      message: matchedMsg.message,
-      date: msgDate,
-    },
-    answers,
-    room_name: matchedMsg.room_name,
-  };
+    // 질문을 못 찾으면 매칭된 메시지 자체만 표시
+    return {
+      id: matchedMsg.id,
+      question: { sender: matchedMsg.sender, message: matchedMsg.message, date: msgDate },
+      answers: [],
+      room_name: matchedMsg.room_name,
+    };
+  }
 }
 
 export async function GET(request: NextRequest) {
