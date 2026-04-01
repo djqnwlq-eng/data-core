@@ -48,23 +48,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  // 2. 임베딩 생성
-  try {
-    const fullText = `${finalTitle}\n${content}`;
-    const chunks = splitIntoChunks(fullText);
-
-    for (const chunk of chunks) {
-      const embedding = await generateEmbedding(chunk);
-      await supabase.from('embeddings').insert({
-        source_table: 'knowledge',
-        source_id: data.id,
-        chunk_text: chunk,
-        embedding: JSON.stringify(embedding),
-      });
-    }
-  } catch (embeddingError) {
-    console.error('임베딩 생성 실패:', embeddingError);
-  }
-
+  // 2. 저장 즉시 응답 (임베딩은 백그라운드에서 처리)
   return NextResponse.json({ data }, { status: 201 });
 }

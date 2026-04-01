@@ -134,8 +134,8 @@ export async function GET(request: NextRequest) {
   // 4. AI 추천 답변 생성
   let aiAnswer: string | null = null;
   const allContent = [
-    ...knowledgeResults.slice(0, 3).map(r => r.content),
-    ...chatResults.slice(0, 5).map(r => `${r.sender}: ${r.content}`),
+    ...knowledgeResults.slice(0, 2).map(r => r.content.slice(0, 500)),
+    ...chatResults.slice(0, 3).map(r => `${r.sender}: ${r.content.slice(0, 300)}`),
   ];
 
   if (allContent.length > 0) {
